@@ -1,0 +1,19 @@
+{
+  "emotion1": 0.06,
+  "emotion2": 0.05,
+  "emotion3": 0.05,
+  "emotion4": 0.05,
+  "emotion5": 0.05,
+  "emotion6": 0.05,
+  "emotion7": 0.1,
+  "emotion8": 0.63,
+  "vq_single": 0.78,
+  "fmax": 24000.0,
+  "pitch_std": 45.0,
+  "speaking_rate": 22.0,
+  "dnsmos_ovrl": 4.0,
+  "speaker_noised": false,
+  "cfg_scale": 2.0,
+  "seed": 420,
+  "use_seed": true
+}
