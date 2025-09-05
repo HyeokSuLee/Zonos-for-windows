@@ -7,11 +7,21 @@ import gradio as gr
 from os import getenv
 import json
 import time
+import asyncio
 from pathlib import Path
+from typing import List, Tuple
 
 from zonos.model import Zonos, DEFAULT_BACKBONE_CLS as ZonosBackbone
 from zonos.conditioning import make_cond_dict, supported_language_codes
 from zonos.utils import DEFAULT_DEVICE as device
+from zonos.memory_efficient_audio import (
+    MemoryEfficientAudioSystem,
+    DialogueSegment,
+    convert_legacy_dialogue_format,
+    estimate_memory_usage
+)
+from zonos.lazy_speaker_manager import LazySpeakerManager, SpeakerInfo
+from datetime import datetime
 
 # 자동처리(무조건 조건) 설정 매핑
 AUTO_SETTING_MAP = {
@@ -43,9 +53,15 @@ if os.path.exists(CONFIG_FILE):
 CURRENT_MODEL_TYPE = None
 CURRENT_MODEL = None
 
-# 여러 화자의 임베딩을 저장할 딕셔너리
+# 여러 화자의 임베딩을 저장할 딕셔너리 (레거시 호환용)
 SPEAKER_EMBEDDINGS = {}
 SPEAKER_AUDIO_PATHS = {}
+
+# Lazy Speaker Manager (새로운 시스템)
+LAZY_SPEAKER_MANAGER = None
+
+# 메모리 효율적 오디오 시스템 (전역 인스턴스)
+MEMORY_EFFICIENT_SYSTEM = None
 
 # 설정값의 기본값을 저장하는 딕셔너리
 DEFAULT_SETTINGS = {
@@ -446,6 +462,32 @@ def update_ui(model_choice):
     )
 
 
+def update_ui_with_auto_loading(model_choice):
+    """모델 변경 시 UI 업데이트 + 자동 화자 목록 로드"""
+    # 기존 UI 업데이트 로직 실행
+    ui_updates = update_ui(model_choice)
+    
+    # 자동 화자 목록 로드 실행
+    speaker_names, loading_message = auto_load_speaker_list_on_startup()
+    
+    # ui_updates를 리스트로 변환해서 speaker_dropdown 업데이트 (3번째 항목이 speaker_management_update)
+    ui_updates_list = list(ui_updates)
+    
+    # speaker_dropdown에 choices 추가 (visibility는 유지하면서 choices 업데이트)
+    if len(ui_updates_list) > 2:  # speaker_management_update가 3번째
+        existing_update = ui_updates_list[2]
+        if isinstance(existing_update, dict) and existing_update.get('visible', True):
+            # visible이 True인 경우에만 choices 업데이트
+            ui_updates_list[2] = gr.update(visible=existing_update.get('visible', True), 
+                                          choices=speaker_names, 
+                                          value=speaker_names[0] if speaker_names else None)
+    
+    # auto_loading_status 메시지 추가
+    ui_updates_list.append(loading_message)
+    
+    return tuple(ui_updates_list)
+
+
 # 새로운 화자를 추가하는 함수 - 수정: 양쪽 드롭다운 모두 업데이트
 def add_speaker(model_choice, speaker_name, speaker_audio, speaker_list):
     global SPEAKER_EMBEDDINGS, SPEAKER_AUDIO_PATHS
@@ -470,6 +512,31 @@ def add_speaker(model_choice, speaker_name, speaker_audio, speaker_list):
         # 원본 파일 복사
         import shutil
         shutil.copy2(speaker_audio, new_audio_path)
+        # Lazy 등록: 임베딩 생성 없이 메타데이터만 저장하고 즉시 반환
+        try:
+            manager = initialize_lazy_speaker_system()
+        except Exception:
+            manager = None
+        try:
+            from datetime import datetime as _dt
+            file_stat = os.stat(new_audio_path)
+            if manager is not None:
+                manager.speakers_info[safe_name] = SpeakerInfo(
+                    name=safe_name,
+                    audio_path=new_audio_path,
+                    created_at=_dt.fromtimestamp(file_stat.st_ctime),
+                    file_size=file_stat.st_size,
+                )
+                manager.save_speaker_metadata()
+        except Exception:
+            pass
+        SPEAKER_AUDIO_PATHS[safe_name] = new_audio_path
+        speaker_list = manager.get_speaker_names() if manager is not None else list(SPEAKER_AUDIO_PATHS.keys())
+        dropdown_update = gr.update(choices=speaker_list, value=safe_name)
+        return (
+            dropdown_update,
+            f"'{safe_name}' 화자가 등록되었습니다. (경로: {new_audio_path})",
+        )
         
         # 화자 임베딩 생성
         wav, sr = torchaudio.load(new_audio_path)
@@ -497,30 +564,33 @@ def add_speaker(model_choice, speaker_name, speaker_audio, speaker_list):
 
 # 화자를 삭제하는 함수 - 수정: 양쪽 드롭다운 모두 업데이트
 def remove_speaker(speaker_name, speaker_list):
-    global SPEAKER_EMBEDDINGS, SPEAKER_AUDIO_PATHS
+    global SPEAKER_AUDIO_PATHS, LAZY_SPEAKER_MANAGER
+    manager = initialize_lazy_speaker_system()
 
-    if speaker_name not in SPEAKER_EMBEDDINGS:
+    if speaker_name not in getattr(manager, 'speakers_info', {}):
         return gr.update(), gr.update(), f"'{speaker_name}' 화자를 찾을 수 없습니다."
 
-    del SPEAKER_EMBEDDINGS[speaker_name]
-    del SPEAKER_AUDIO_PATHS[speaker_name]
+    manager.unload_speaker(speaker_name)
+    if speaker_name in manager.speakers_info:
+        del manager.speakers_info[speaker_name]
+    if speaker_name in SPEAKER_AUDIO_PATHS:
+        del SPEAKER_AUDIO_PATHS[speaker_name]
+    manager.save_speaker_metadata()
 
-    speaker_list = list(SPEAKER_EMBEDDINGS.keys())
+    speaker_list = manager.get_speaker_names()
 
     if speaker_list:
         dropdown_update = gr.update(choices=speaker_list, value=speaker_list[0])
-        inline_dropdown_update = gr.update(choices=speaker_list, value=speaker_list[0])
         return (
             dropdown_update,
-            inline_dropdown_update,
+            
             f"'{speaker_name}' 화자가 삭제되었습니다.",
         )
     else:
         dropdown_update = gr.update(choices=[], value=None)
-        inline_dropdown_update = gr.update(choices=[], value=None)
         return (
             dropdown_update,
-            inline_dropdown_update,
+            
             f"'{speaker_name}' 화자가 삭제되었습니다.",
         )
 
@@ -649,9 +719,9 @@ def generate_multi_speaker_audio(
     progress=gr.Progress(),
 ):
     """
-    여러 화자의 대화를 생성하는 함수 - 화자별 설정 적용 가능
+    메모리 효율적 다중 화자 음성 생성 함수
     """
-    global SPEAKER_EMBEDDINGS, DEFAULT_SETTINGS
+    global SPEAKER_EMBEDDINGS, DEFAULT_SETTINGS, MEMORY_EFFICIENT_SYSTEM, LAZY_SPEAKER_MANAGER
 
     try:
         # UI의 설정값을 기본값으로 설정
@@ -679,7 +749,34 @@ def generate_multi_speaker_audio(
         if not dialogue_text.strip():
             return (None, None), seed, "대화 텍스트를 입력해주세요."
 
-        if not SPEAKER_EMBEDDINGS:
+        # Lazy Speaker 시스템이 있는 경우 자동 로딩 시도
+        if LAZY_SPEAKER_MANAGER is not None:
+            # 대화에서 필요한 화자들 추출
+            dialogue_parts = parse_dialogue(dialogue_text)
+            required_speakers = set()
+            for speaker, _, _ in dialogue_parts:
+                if speaker != "Unknown":
+                    required_speakers.add(speaker)
+            
+            if required_speakers:
+                # 아직 로드되지 않은 화자들 확인
+                unloaded_speakers = []
+                for speaker in required_speakers:
+                    if not LAZY_SPEAKER_MANAGER.is_speaker_loaded(speaker):
+                        unloaded_speakers.append(speaker)
+                
+                # 필요한 화자들을 자동으로 로드
+                if unloaded_speakers:
+                    print(f"🔄 자동 로딩 중: {', '.join(unloaded_speakers)}")
+                    loaded_count, load_message = load_speaker_embeddings_on_demand(unloaded_speakers)
+                    
+                    if loaded_count == 0:
+                        return (None, None), seed, f"필요한 화자 로드 실패: {load_message}"
+                    
+                    print(f"✅ 자동 로딩 완료: {load_message}")
+
+        # 기존 검증 로직 유지 (레거시 호환)
+        if not SPEAKER_EMBEDDINGS and (LAZY_SPEAKER_MANAGER is None or not LAZY_SPEAKER_MANAGER.get_speaker_names()):
             return (None, None), seed, "적어도 하나의 화자를 추가해주세요."
 
         # 대화 파싱 - 화자별 설정 포함
@@ -948,6 +1045,14 @@ def generate_multi_speaker_audio(
 
 
 def save_speakers(speaker_list):
+    try:
+        manager = initialize_lazy_speaker_system()
+        if manager.save_speaker_metadata():
+            return f"화자 목록이 {os.path.join(USER_DATA_DIR, 'saved_speakers.json')} 파일로 저장되었습니다."
+        else:
+            return "화자 목록 저장 중 오류 발생: 메타데이터 저장 실패"
+    except Exception as e:
+        return f"화자 목록 저장 중 오류 발생: {str(e)}"
     """화자 목록을 파일로 저장"""
     global SPEAKER_AUDIO_PATHS
 
@@ -966,52 +1071,156 @@ def save_speakers(speaker_list):
 
 
 # 화자 목록 불러오기 함수 수정 - 양쪽 드롭다운 업데이트
-def load_speakers(model_choice):
-    """저장된 화자 목록을 불러옴"""
-    global SPEAKER_EMBEDDINGS, SPEAKER_AUDIO_PATHS
+def initialize_lazy_speaker_system():
+    """Lazy Speaker 시스템 초기화"""
+    global LAZY_SPEAKER_MANAGER, CURRENT_MODEL
+    
+    if LAZY_SPEAKER_MANAGER is None:
+        LAZY_SPEAKER_MANAGER = LazySpeakerManager(
+            data_dir=USER_DATA_DIR,
+            device=device
+        )
+    
+    if CURRENT_MODEL is not None:
+        LAZY_SPEAKER_MANAGER.set_model(CURRENT_MODEL)
+    
+    return LAZY_SPEAKER_MANAGER
 
+def auto_load_speaker_list_on_startup():
+    """앱 시작시 자동으로 화자 목록 로드"""
+    global LAZY_SPEAKER_MANAGER, SPEAKER_EMBEDDINGS, SPEAKER_AUDIO_PATHS
+    
     try:
-        speakers_json_path = os.path.join(USER_DATA_DIR, "saved_speakers.json")
-        if not os.path.exists(speakers_json_path):
-            return gr.update(), gr.update(), "저장된 화자 목록을 찾을 수 없습니다."
-
-        with open(speakers_json_path, "r", encoding="utf-8") as f:
-            speaker_data = json.load(f)
-
-        selected_model = load_model_if_needed(model_choice)
-
-        # 기존 목록 초기화
-        SPEAKER_EMBEDDINGS = {}
-        SPEAKER_AUDIO_PATHS = {}
-
-        # 화자 임베딩 재생성
-        for speaker_name, audio_path in speaker_data.items():
-            if os.path.exists(audio_path):
-                wav, sr = torchaudio.load(audio_path)
-                embedding = selected_model.make_speaker_embedding(wav, sr)
-                embedding = embedding.to(device, dtype=torch.bfloat16)
-
-                SPEAKER_EMBEDDINGS[speaker_name] = embedding
-                SPEAKER_AUDIO_PATHS[speaker_name] = audio_path
-
-        speaker_list = list(SPEAKER_EMBEDDINGS.keys())
-
-        if speaker_list:
-            dropdown_update = gr.update(choices=speaker_list, value=speaker_list[0])
-            inline_dropdown_update = gr.update(
-                choices=speaker_list, value=speaker_list[0]
-            )
-            return (
-                dropdown_update,
-                inline_dropdown_update,
-                f"{len(speaker_list)}개의 화자를 불러왔습니다. (저장 위치: {USER_DATA_DIR})",
-            )
+        # Lazy Speaker Manager 초기화
+        manager = initialize_lazy_speaker_system()
+        
+        # 화자 목록만 빠르게 로드 (임베딩 생성 없음)
+        success, message, speaker_names = manager.load_speaker_list_on_startup()
+        
+        if success and speaker_names:
+            # 레거시 호환을 위해 기존 딕셔너리도 업데이트 (임베딩은 없이)
+            SPEAKER_AUDIO_PATHS = {}
+            for name in speaker_names:
+                if name in manager.speakers_info:
+                    SPEAKER_AUDIO_PATHS[name] = manager.speakers_info[name].audio_path
+            
+            print(f"🚀 자동 로드 완료: {message}")
+            return speaker_names, message
         else:
-            dropdown_update = gr.update(choices=[], value=None)
-            inline_dropdown_update = gr.update(choices=[], value=None)
-            return dropdown_update, inline_dropdown_update, "불러올 화자가 없습니다."
+            print(f"⚠️ 자동 로드 실패: {message}")
+            return [], message
+            
     except Exception as e:
-        return gr.update(), gr.update(), f"화자 목록 불러오기 중 오류 발생: {str(e)}"
+        error_msg = f"자동 화자 목록 로드 실패: {str(e)}"
+        print(f"❌ {error_msg}")
+        return [], error_msg
+
+def load_speaker_embeddings_on_demand(speaker_names: List[str]) -> Tuple[int, str]:
+    """필요할 때 화자 임베딩들을 로드"""
+    global LAZY_SPEAKER_MANAGER, SPEAKER_EMBEDDINGS, CURRENT_MODEL
+    
+    if LAZY_SPEAKER_MANAGER is None:
+        return 0, "Lazy Speaker Manager가 초기화되지 않았습니다."
+    
+    if CURRENT_MODEL is None:
+        return 0, "모델이 로드되지 않았습니다. 먼저 모델을 선택해주세요."
+    
+    # 모델 설정 (혹시 모르니)
+    LAZY_SPEAKER_MANAGER.set_model(CURRENT_MODEL)
+    
+    try:
+        # 요청된 화자들의 임베딩 로드
+        loaded_embeddings = LAZY_SPEAKER_MANAGER.load_multiple_speakers(speaker_names)
+        
+        # 레거시 호환을 위해 전역 딕셔너리에도 복사
+        SPEAKER_EMBEDDINGS.update(loaded_embeddings)
+        
+        loaded_count = len(loaded_embeddings)
+        failed_count = len(speaker_names) - loaded_count
+        
+        if loaded_count > 0:
+            message = f"✅ {loaded_count}개 화자 임베딩 로드 완료"
+            if failed_count > 0:
+                message += f" ({failed_count}개 실패)"
+        else:
+            message = "❌ 임베딩 로드에 실패했습니다."
+        
+        return loaded_count, message
+        
+    except Exception as e:
+        error_msg = f"임베딩 로드 중 오류: {str(e)}"
+        return 0, error_msg
+
+def initialize_memory_efficient_system():
+    """메모리 효율적 오디오 시스템 초기화"""
+    global MEMORY_EFFICIENT_SYSTEM, CURRENT_MODEL, SPEAKER_EMBEDDINGS, LAZY_SPEAKER_MANAGER
+    
+    if CURRENT_MODEL is None or not SPEAKER_EMBEDDINGS:
+        return None
+    
+    try:
+        # 기본 설정 준비
+        default_settings = {
+            "emotion1": DEFAULT_SETTINGS.get("emotion1", 1.0),
+            "emotion2": DEFAULT_SETTINGS.get("emotion2", 0.05),
+            "emotion3": DEFAULT_SETTINGS.get("emotion3", 0.05),
+            "emotion4": DEFAULT_SETTINGS.get("emotion4", 0.05),
+            "emotion5": DEFAULT_SETTINGS.get("emotion5", 0.05),
+            "emotion6": DEFAULT_SETTINGS.get("emotion6", 0.05),
+            "emotion7": DEFAULT_SETTINGS.get("emotion7", 0.1),
+            "emotion8": DEFAULT_SETTINGS.get("emotion8", 0.2),
+            "vq_single": DEFAULT_SETTINGS.get("vq_single", 0.78),
+            "fmax": DEFAULT_SETTINGS.get("fmax", 24000),
+            "pitch_std": DEFAULT_SETTINGS.get("pitch_std", 45.0),
+            "speaking_rate": DEFAULT_SETTINGS.get("speaking_rate", 15.0),
+            "dnsmos_ovrl": DEFAULT_SETTINGS.get("dnsmos_ovrl", 4.0),
+            "speaker_noised": DEFAULT_SETTINGS.get("speaker_noised", False),
+            "cfg_scale": DEFAULT_SETTINGS.get("cfg_scale", 2.0),
+            "seed": DEFAULT_SETTINGS.get("seed", 420),
+        }
+        
+        # 메모리 효율적 시스템 초기화
+        MEMORY_EFFICIENT_SYSTEM = MemoryEfficientAudioSystem(
+            model=CURRENT_MODEL,
+            speaker_embeddings=SPEAKER_EMBEDDINGS,
+            temp_dir=os.path.join(USER_DATA_DIR, "temp_segments"),
+            default_settings=default_settings
+        )
+        
+        print(f"✅ 메모리 효율적 오디오 시스템 초기화 완료 ({len(SPEAKER_EMBEDDINGS)}명 화자)")
+        return MEMORY_EFFICIENT_SYSTEM
+        
+    except Exception as e:
+        print(f"❌ 메모리 효율적 시스템 초기화 실패: {e}")
+        return None
+
+def load_speakers(model_choice):
+    """저장된 화자 목록을 불러옴 (레거시 함수 - 자동 로딩으로 대체됨)"""
+    
+    # 새로운 자동 로딩 시스템 정보 메시지
+    info_message = (
+        "ℹ️ 이제 화자 목록은 모델 선택 시 자동으로 로드됩니다!\n"
+        "수동 로딩이 필요하지 않습니다. 모델을 선택하면 화자 목록과 필요한 임베딩이 자동으로 처리됩니다."
+    )
+    
+    # 현재 로드된 화자 목록 가져오기
+    if LAZY_SPEAKER_MANAGER:
+        current_speakers = LAZY_SPEAKER_MANAGER.get_speaker_names()
+        if current_speakers:
+            info_message += f"\n\n현재 {len(current_speakers)}개 화자가 로드되어 있습니다: {', '.join(current_speakers[:5])}"
+            if len(current_speakers) > 5:
+                info_message += f" 외 {len(current_speakers) - 5}개"
+        else:
+            info_message += "\n\n화자가 로드되지 않았습니다. 모델을 먼저 선택해주세요."
+    
+    # 현재 dropdown 상태 유지하면서 메시지만 업데이트
+    current_choices = LAZY_SPEAKER_MANAGER.get_speaker_names() if LAZY_SPEAKER_MANAGER else []
+    
+    return (
+        gr.update(choices=current_choices, value=current_choices[0] if current_choices else None),
+        gr.update(choices=current_choices, value=current_choices[0] if current_choices else None), 
+        info_message
+    )
 
 
 # 설정 추가 함수 - 간소화된 버전
@@ -1467,13 +1676,20 @@ def build_interface():
                     add_speaker_button = gr.Button("화자 추가")
                     remove_speaker_button = gr.Button("화자 삭제")
                     save_speakers_button = gr.Button("화자 목록 저장")
-                    load_speakers_button = gr.Button("화자 목록 불러오기")
+                    load_speakers_button = gr.Button("화자 상태 확인 (자동 로딩)", visible=False)
 
                 speaker_dropdown = gr.Dropdown(
                     label="화자 목록", choices=[], info="현재 등록된 화자 목록"
                 )
 
                 speaker_message = gr.Textbox(label="상태 메시지", interactive=False)
+                
+                # 자동 로딩 상태 표시
+                auto_loading_status = gr.Textbox(
+                    label="자동 로딩 상태", 
+                    interactive=False,
+                    value="모델 선택 후 화자 목록이 자동으로 로드됩니다..."
+                )
                 
                 # 데이터 저장 경로 설정 버튼 이벤트 연결
                 update_dir_button.click(fn=update_data_directory, inputs=[data_dir_input], outputs=[speaker_message])
@@ -1651,12 +1867,8 @@ def build_interface():
         add_speaker_button.click(
             fn=lambda: (
                 gr.update(
-                    choices=list(SPEAKER_EMBEDDINGS.keys()),
-                    value=(
-                        list(SPEAKER_EMBEDDINGS.keys())[0]
-                        if SPEAKER_EMBEDDINGS
-                        else None
-                    ),
+                    choices=(LAZY_SPEAKER_MANAGER.get_speaker_names() if LAZY_SPEAKER_MANAGER else []),
+                    value=(LAZY_SPEAKER_MANAGER.get_speaker_names()[0] if LAZY_SPEAKER_MANAGER and LAZY_SPEAKER_MANAGER.get_speaker_names() else None),
                 ),
                 "화자 목록이 업데이트되었습니다.",
             ),
@@ -1674,12 +1886,8 @@ def build_interface():
         remove_speaker_button.click(
             fn=lambda: (
                 gr.update(
-                    choices=list(SPEAKER_EMBEDDINGS.keys()),
-                    value=(
-                        list(SPEAKER_EMBEDDINGS.keys())[0]
-                        if SPEAKER_EMBEDDINGS
-                        else None
-                    ),
+                    choices=(LAZY_SPEAKER_MANAGER.get_speaker_names() if LAZY_SPEAKER_MANAGER else []),
+                    value=(LAZY_SPEAKER_MANAGER.get_speaker_names()[0] if LAZY_SPEAKER_MANAGER and LAZY_SPEAKER_MANAGER.get_speaker_names() else None),
                 ),
                 "화자 목록이 업데이트되었습니다.",
             ),
@@ -1701,12 +1909,8 @@ def build_interface():
         load_speakers_button.click(
             fn=lambda: (
                 gr.update(
-                    choices=list(SPEAKER_EMBEDDINGS.keys()),
-                    value=(
-                        list(SPEAKER_EMBEDDINGS.keys())[0]
-                        if SPEAKER_EMBEDDINGS
-                        else None
-                    ),
+                    choices=(LAZY_SPEAKER_MANAGER.get_speaker_names() if LAZY_SPEAKER_MANAGER else []),
+                    value=(LAZY_SPEAKER_MANAGER.get_speaker_names()[0] if LAZY_SPEAKER_MANAGER and LAZY_SPEAKER_MANAGER.get_speaker_names() else None),
                 ),
                 "화자 목록이 업데이트되었습니다.",
             ),
@@ -1911,14 +2115,14 @@ def build_interface():
             outputs=[output_audio, seed_number, output_message],
         )
 
-        # 모델 변경 시 UI 업데이트
+        # 모델 변경 시 UI 업데이트 + 자동 화자 로딩
         model_choice.change(
-            fn=update_ui,
+            fn=update_ui_with_auto_loading,
             inputs=[model_choice],
             outputs=[
                 dialogue_text,
                 language,
-                speaker_dropdown,
+                speaker_dropdown,  # UI visibility + choices 업데이트
                 prefix_audio,
                 emotion1,
                 emotion2,
@@ -1935,11 +2139,33 @@ def build_interface():
                 dnsmos_slider,
                 speaker_noised_checkbox,
                 unconditional_keys,
+                auto_loading_status,  # 자동 로딩 상태
             ],
         )
         
-        # 시작 시 안내 메시지
-        demo.load(lambda: f"Zonos TTS 시스템이 시작되었습니다. 데이터 저장 경로: {USER_DATA_DIR}", None, speaker_message)
+        # 시작 시 안내 메시지 + 자동 로딩 상태 초기화
+        demo.load(
+            lambda: (
+                f"Zonos TTS 시스템이 시작되었습니다. 데이터 저장 경로: {USER_DATA_DIR}",
+                "모델을 선택하면 화자 목록이 자동으로 로드됩니다..."
+            ), 
+            None, 
+            [speaker_message, auto_loading_status]
+        )
+
+        # 앱 시작 시 화자 목록 자동 로드 및 드롭다운/메시지 업데이트
+        def _startup_loader():
+            names, msg = auto_load_speaker_list_on_startup()
+            dd = gr.update(choices=names, value=(names[0] if names else None))
+            dd2 = gr.update(choices=names, value=(names[0] if names else None))
+            start_msg = f"Zonos TTS 서비스가 시작되었습니다. 데이터 경로: {USER_DATA_DIR}"
+            return dd, dd2, start_msg, msg
+
+        demo.load(
+            _startup_loader,
+            None,
+            [speaker_dropdown, speaker_dropdown_inline, speaker_message, auto_loading_status]
+        )
 
     return demo
 
