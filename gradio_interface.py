@@ -396,16 +396,34 @@ def concatenate_audio(audio_segments, silence_duration=0.2):
     return np.concatenate(concatenated)
 def load_model_if_needed(model_choice: str):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
-    if CURRENT_MODEL_TYPE != model_choice:
-        if CURRENT_MODEL is not None:
-            del CURRENT_MODEL
-            torch.cuda.empty_cache()
-        print(f"Loading {model_choice} model...")
-        CURRENT_MODEL = Zonos.from_pretrained(model_choice, device=device)
-        CURRENT_MODEL.requires_grad_(False).eval()
-        CURRENT_MODEL_TYPE = model_choice
-        print(f"{model_choice} model loaded successfully!")
-    return CURRENT_MODEL
+    
+    try:
+        # 모델 타입이 다르거나 실제 모델이 로드되지 않은 경우 새로 로드
+        if CURRENT_MODEL_TYPE != model_choice or CURRENT_MODEL is None:
+            if CURRENT_MODEL is not None:
+                del CURRENT_MODEL
+                torch.cuda.empty_cache()
+            print(f"🔄 Loading {model_choice} model...")
+            CURRENT_MODEL = Zonos.from_pretrained(model_choice, device=device)
+            CURRENT_MODEL.requires_grad_(False).eval()
+            CURRENT_MODEL_TYPE = model_choice
+            print(f"✅ {model_choice} model loaded successfully!")
+            
+            # 메모리 효율적 시스템 초기화 시도
+            try:
+                initialize_memory_efficient_system()
+            except Exception as e:
+                print(f"⚠️ 메모리 효율적 시스템 초기화 실패 (레거시 모드로 진행): {e}")
+        else:
+            print(f"✅ {model_choice} model already loaded")
+            
+        return CURRENT_MODEL
+        
+    except Exception as e:
+        print(f"❌ 모델 로딩 실패: {model_choice} - {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def update_ui(model_choice):
@@ -747,7 +765,7 @@ def generate_multi_speaker_audio(
         )
 
         if not dialogue_text.strip():
-            return (None, None), seed, "대화 텍스트를 입력해주세요."
+            return None, seed, "대화 텍스트를 입력해주세요."
 
         # Lazy Speaker 시스템이 있는 경우 자동 로딩 시도
         if LAZY_SPEAKER_MANAGER is not None:
@@ -771,19 +789,19 @@ def generate_multi_speaker_audio(
                     loaded_count, load_message = load_speaker_embeddings_on_demand(unloaded_speakers)
                     
                     if loaded_count == 0:
-                        return (None, None), seed, f"필요한 화자 로드 실패: {load_message}"
+                        return None, seed, f"필요한 화자 로드 실패: {load_message}"
                     
                     print(f"✅ 자동 로딩 완료: {load_message}")
 
         # 기존 검증 로직 유지 (레거시 호환)
         if not SPEAKER_EMBEDDINGS and (LAZY_SPEAKER_MANAGER is None or not LAZY_SPEAKER_MANAGER.get_speaker_names()):
-            return (None, None), seed, "적어도 하나의 화자를 추가해주세요."
+            return None, seed, "적어도 하나의 화자를 추가해주세요."
 
         # 대화 파싱 - 화자별 설정 포함
         dialogue_parts = parse_dialogue(dialogue_text)
 
         if not dialogue_parts:
-            return (None, None), seed, "유효한 대화를 찾을 수 없습니다."
+            return None, seed, "유효한 대화를 찾을 수 없습니다."
 
         # 화자가 존재하는지 검증
         unknown_speakers = []
@@ -793,7 +811,7 @@ def generate_multi_speaker_audio(
 
         if unknown_speakers:
             return (
-                (None, None),
+                None,
                 seed,
                 f"다음 화자를 찾을 수 없습니다: {', '.join(unknown_speakers)}",
             )
@@ -1009,7 +1027,7 @@ def generate_multi_speaker_audio(
                 # 빈 오디오인지 확인
                 if len(final_audio) == 0 or np.all(final_audio == 0):
                     return (
-                        (None, None),
+                        None,
                         current_seed,
                         "생성된 오디오가 없습니다. 다시 시도해주세요.",
                     )
@@ -1025,13 +1043,13 @@ def generate_multi_speaker_audio(
             except Exception as e:
                 print(f"오디오 합치기 중 오류 발생: {str(e)}")
                 return (
-                    (None, None),
+                    None,
                     current_seed,
                     f"오디오 합치기 중 오류 발생: {str(e)}",
                 )
         else:
             return (
-                (None, None),
+                None,
                 current_seed,
                 "생성된 오디오가 없습니다. 다시 시도해주세요."
                 )
@@ -1041,7 +1059,7 @@ def generate_multi_speaker_audio(
         import traceback
 
         traceback.print_exc()
-        return (None, None), seed, f"음성 생성 중 오류 발생: {str(e)}"
+        return None, seed, f"음성 생성 중 오류 발생: {str(e)}"
 
 
 def save_speakers(speaker_list):
@@ -1117,16 +1135,35 @@ def auto_load_speaker_list_on_startup():
 
 def load_speaker_embeddings_on_demand(speaker_names: List[str]) -> Tuple[int, str]:
     """필요할 때 화자 임베딩들을 로드"""
-    global LAZY_SPEAKER_MANAGER, SPEAKER_EMBEDDINGS, CURRENT_MODEL
+    global LAZY_SPEAKER_MANAGER, SPEAKER_EMBEDDINGS, CURRENT_MODEL, CURRENT_MODEL_TYPE
     
     if LAZY_SPEAKER_MANAGER is None:
         return 0, "Lazy Speaker Manager가 초기화되지 않았습니다."
     
-    if CURRENT_MODEL is None:
-        return 0, "모델이 로드되지 않았습니다. 먼저 모델을 선택해주세요."
-    
-    # 모델 설정 (혹시 모르니)
-    LAZY_SPEAKER_MANAGER.set_model(CURRENT_MODEL)
+    # 현재 모델 타입이 있으면 해당 모델로 로드 시도
+    if CURRENT_MODEL_TYPE:
+        try:
+            print(f"🔄 화자 로딩을 위해 모델 확인 중: {CURRENT_MODEL_TYPE}")
+            print(f"🔍 현재 CURRENT_MODEL 상태: {CURRENT_MODEL is not None} (None이 아님: {CURRENT_MODEL is not None})")
+            
+            current_model = load_model_if_needed(CURRENT_MODEL_TYPE)
+            print(f"🔍 load_model_if_needed 결과: {current_model is not None} (None이 아님: {current_model is not None})")
+            
+            if current_model is not None:
+                LAZY_SPEAKER_MANAGER.set_model(current_model)
+                print(f"✅ 화자 로딩용 모델 준비 완료: {CURRENT_MODEL_TYPE}")
+            else:
+                error_msg = f"모델 로딩에 실패했습니다. 모델: {CURRENT_MODEL_TYPE}\n디버깅: CURRENT_MODEL={CURRENT_MODEL is not None}, CURRENT_MODEL_TYPE={CURRENT_MODEL_TYPE}"
+                print(f"❌ {error_msg}")
+                return 0, error_msg
+        except Exception as e:
+            error_msg = f"모델 로딩 중 오류 발생: {str(e)}\n모델: {CURRENT_MODEL_TYPE}"
+            print(f"❌ {error_msg}")
+            import traceback
+            traceback.print_exc()
+            return 0, error_msg
+    else:
+        return 0, "모델이 선택되지 않았습니다. 앱이 완전히 로드될 때까지 기다린 후 다시 시도해주세요."
     
     try:
         # 요청된 화자들의 임베딩 로드
@@ -1511,9 +1548,15 @@ def delete_dialogue(dialogue_name):
 
 
 def build_interface():
+    global CURRENT_MODEL_TYPE
+    
     supported_models = []
     if "transformer" in ZonosBackbone.supported_architectures:
         supported_models.append("Zyphra/Zonos-v0.1-transformer")
+    
+    # 기본 모델 타입은 _startup_loader에서 설정 및 로딩
+    print(f"🎯 지원되는 모델: {supported_models}")
+    print(f"📋 모델 로딩은 앱 시작 시 자동으로 수행됩니다.")
 
     if "hybrid" in ZonosBackbone.supported_architectures:
         supported_models.append("Zyphra/Zonos-v0.1-hybrid")
@@ -2155,10 +2198,25 @@ def build_interface():
 
         # 앱 시작 시 화자 목록 자동 로드 및 드롭다운/메시지 업데이트
         def _startup_loader():
+            # 1. 기본 모델 자동 로드
+            default_model = supported_models[0] if supported_models else "Zyphra/Zonos-v0.1-transformer"
+            print(f"🚀 앱 시작 시 기본 모델 자동 로드: {default_model}")
+            
+            try:
+                # 모델을 로드하여 전역 변수 설정
+                loaded_model = load_model_if_needed(default_model)
+                if loaded_model is not None:
+                    print(f"✅ 시작 시 모델 로드 완료: {default_model}")
+                else:
+                    print(f"❌ 시작 시 모델 로드 실패: {default_model}")
+            except Exception as e:
+                print(f"❌ 시작 시 모델 로드 중 오류: {e}")
+            
+            # 2. 화자 목록 자동 로드
             names, msg = auto_load_speaker_list_on_startup()
             dd = gr.update(choices=names, value=(names[0] if names else None))
             dd2 = gr.update(choices=names, value=(names[0] if names else None))
-            start_msg = f"Zonos TTS 서비스가 시작되었습니다. 데이터 경로: {USER_DATA_DIR}"
+            start_msg = f"Zonos TTS 서비스가 시작되었습니다. 모델: {default_model}, 데이터 경로: {USER_DATA_DIR}"
             return dd, dd2, start_msg, msg
 
         demo.load(

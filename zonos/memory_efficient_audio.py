@@ -10,7 +10,7 @@ import gc
 import json
 import uuid
 import logging
-import asyncio
+import psutil
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -23,6 +23,51 @@ from scipy import signal
 from scipy.stats import zscore
 
 logger = logging.getLogger(__name__)
+
+# ==================== 메모리 모니터링 유틸리티 ====================
+
+def check_memory_usage(threshold_percent: float = 80.0) -> Dict[str, Any]:
+    """메모리 사용량 체크 및 경고"""
+    
+    memory = psutil.virtual_memory()
+    gpu_memory = {}
+    
+    # GPU 메모리 체크 (가능한 경우)
+    if torch.cuda.is_available():
+        gpu_memory = {
+            'allocated_mb': torch.cuda.memory_allocated() / (1024**2),
+            'reserved_mb': torch.cuda.memory_reserved() / (1024**2),
+            'max_allocated_mb': torch.cuda.max_memory_allocated() / (1024**2)
+        }
+    
+    memory_info = {
+        'ram_percent': memory.percent,
+        'ram_available_gb': memory.available / (1024**3),
+        'ram_used_gb': memory.used / (1024**3),
+        'gpu_memory': gpu_memory,
+        'warning': memory.percent > threshold_percent
+    }
+    
+    if memory_info['warning']:
+        logger.warning(f"🚨 높은 메모리 사용량 감지: {memory.percent:.1f}% (임계값: {threshold_percent}%)")
+        if gpu_memory:
+            logger.warning(f"GPU 메모리: {gpu_memory['allocated_mb']:.1f}MB 사용 중")
+    
+    return memory_info
+
+def force_memory_cleanup():
+    """강제 메모리 정리"""
+    logger.info("🧹 강제 메모리 정리 실행 중...")
+    
+    # Python GC
+    collected = gc.collect()
+    
+    # GPU 메모리 정리
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 모든 CUDA 연산 완료 대기
+    
+    logger.info(f"메모리 정리 완료: {collected}개 객체 해제")
 
 # ==================== 데이터 클래스 ====================
 
@@ -362,7 +407,7 @@ class MemoryEfficientSegmentGenerator:
         self.speaker_embeddings = speaker_embeddings
         self.file_manager = file_manager
         
-    async def generate_segments_to_files(
+    def generate_segments_to_files(
         self, 
         segments: List[DialogueSegment],
         progress_callback: Optional[Callable] = None
@@ -373,6 +418,13 @@ class MemoryEfficientSegmentGenerator:
         
         for i, dialogue_seg in enumerate(segments):
             try:
+                # 🔍 메모리 모니터링 (매 10개 세그먼트마다)
+                if i % 10 == 0:
+                    memory_info = check_memory_usage(threshold_percent=75.0)
+                    if memory_info['warning']:
+                        logger.warning(f"세그먼트 {i}: 메모리 사용량 높음, 강제 정리 실행")
+                        force_memory_cleanup()
+                
                 if progress_callback:
                     progress_callback(
                         i / len(segments), 
@@ -387,7 +439,7 @@ class MemoryEfficientSegmentGenerator:
                 speaker_embedding = self.speaker_embeddings[dialogue_seg.speaker_name]
                 
                 # 2. 음성 생성 (Zonos 모델 사용)
-                audio_data = await self._generate_audio_for_segment(
+                audio_data = self._generate_audio_for_segment(
                     dialogue_seg, speaker_embedding
                 )
                 
@@ -413,13 +465,13 @@ class MemoryEfficientSegmentGenerator:
                 
                 segment_files.append(segment_file)
                 
-                # 5. 명시적 메모리 해제
-                del audio_data, speaker_embedding
-                gc.collect()
+                # 5. 명시적 메모리 해제 (audio_data는 이미 파일 저장 시 해제됨)
+                # speaker_embedding은 다른 곳에서 관리되므로 여기서 해제하지 않음
                 
-                # 6. GPU 메모리 정리 (필요시)
-                if torch.cuda.is_available():
+                # 6. GPU 메모리 정리 (필요시 - 주기적 정리)
+                if i % 5 == 0 and torch.cuda.is_available():  # 5개 세그먼트마다 정리
                     torch.cuda.empty_cache()
+                    gc.collect()
                 
                 logger.debug(f"Generated and saved segment {i}: {dialogue_seg.speaker_name}")
                 
@@ -430,10 +482,16 @@ class MemoryEfficientSegmentGenerator:
         if progress_callback:
             progress_callback(1.0, f"모든 세그먼트 생성 완료! ({len(segment_files)}개)")
         
-        logger.info(f"Generated {len(segment_files)} segments out of {len(segments)} requested")
+        # 🎯 최종 메모리 상태 체크
+        final_memory = check_memory_usage()
+        logger.info(f"생성 완료: {len(segment_files)}/{len(segments)} 세그먼트")
+        logger.info(f"최종 메모리 사용량: RAM {final_memory['ram_percent']:.1f}%")
+        if final_memory['gpu_memory']:
+            logger.info(f"최종 GPU 메모리: {final_memory['gpu_memory']['allocated_mb']:.1f}MB")
+        
         return segment_files
     
-    async def _generate_audio_for_segment(
+    def _generate_audio_for_segment(
         self, 
         segment: DialogueSegment, 
         speaker_embedding: torch.Tensor
@@ -441,35 +499,80 @@ class MemoryEfficientSegmentGenerator:
         """단일 세그먼트의 음성 생성"""
         
         try:
-            # Zonos 모델을 사용한 음성 생성
-            # 기존 generate_multi_speaker_audio 로직을 참조하여 구현
+            # Zonos 모델을 사용한 음성 생성 (기존 gradio_interface.py 로직 기반)
+            from zonos.conditioning import make_cond_dict
+            from zonos.utils import DEFAULT_DEVICE as device
             
-            # 설정 준비
-            generation_kwargs = {
-                'text': segment.text,
-                'speaker_embedding': speaker_embedding,
-                **segment.settings
-            }
+            # 감정 벡터 준비 (기본값 또는 설정값 사용)
+            emotion_values = [
+                segment.settings.get("emotion1", 0.0),
+                segment.settings.get("emotion2", 0.0), 
+                segment.settings.get("emotion3", 0.0),
+                segment.settings.get("emotion4", 0.0),
+                segment.settings.get("emotion5", 0.0),
+                segment.settings.get("emotion6", 0.0),
+                segment.settings.get("emotion7", 0.0),
+                segment.settings.get("emotion8", 0.0)
+            ]
+            emotion_tensor = torch.tensor(emotion_values, device=device)
             
-            # 비동기 생성 (필요시 동기로 변경)
-            if hasattr(self.model, 'generate_async'):
-                audio_data = await self.model.generate_async(**generation_kwargs)
-            else:
-                # 동기 방식으로 fallback
-                audio_data = self.model.generate(**generation_kwargs)
+            # VQ 점수 준비
+            vq_single = segment.settings.get("vq_single", 0.0)
+            vq_tensor = torch.tensor([vq_single] * 8, device=device).unsqueeze(0)
+            
+            # 조건부 딕셔너리 생성
+            cond_dict = make_cond_dict(
+                text=segment.text[:500],  # 길이 제한
+                language=segment.settings.get("language", "ko"),
+                speaker=speaker_embedding,
+                emotion=emotion_tensor,
+                vqscore_8=vq_tensor,
+                fmax=segment.settings.get("fmax", 8000.0),
+                pitch_std=segment.settings.get("pitch_std", 1.0),
+                speaking_rate=segment.settings.get("speaking_rate", 1.0),
+                dnsmos_ovrl=segment.settings.get("dnsmos_ovrl", 3.0),
+                speaker_noised=segment.settings.get("speaker_noised", False),
+                device=device,
+                unconditional_keys=segment.settings.get("unconditional_keys", []),
+            )
+            
+            # 조건부 준비
+            conditioning = self.model.prepare_conditioning(cond_dict)
+            
+            # 음성 생성
+            codes = self.model.generate(
+                prefix_conditioning=conditioning,
+                max_new_tokens=min(86 * 20, 86 * int(len(segment.text) / 10) + 86),  # 텍스트 길이에 따른 동적 조정
+                cfg_scale=segment.settings.get("cfg_scale", 3.0),
+                batch_size=1,
+                sampling_params=dict(
+                    linear=float(segment.settings.get("linear", 0.0)),
+                    conf=float(segment.settings.get("confidence", 1.0)), 
+                    quad=float(segment.settings.get("quadratic", 0.0))
+                )
+            )
+            
+            # 오디오 디코딩
+            wav_out = self.model.autoencoder.decode(codes).cpu().detach()
+            if wav_out.dim() == 2 and wav_out.size(0) > 1:
+                wav_out = wav_out[0:1, :]
             
             # numpy 배열로 변환
-            if isinstance(audio_data, torch.Tensor):
-                audio_data = audio_data.detach().cpu().numpy()
+            audio_data = wav_out.squeeze().numpy()
             
-            # 1차원 배열로 변환 (필요시)
-            if audio_data.ndim > 1:
-                audio_data = audio_data.flatten()
+            # 🔥 GPU/CPU Tensor 명시적 해제 (메모리 누수 방지)
+            del codes, wav_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             
+            logger.debug(f"Generated audio segment: {audio_data.shape}, text: '{segment.text[:50]}...'")
             return audio_data
             
         except Exception as e:
-            logger.error(f"Audio generation failed for segment: {e}")
+            logger.error(f"Audio generation failed for segment '{segment.text[:50]}...': {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 # ==================== 배치 볼륨 처리 시스템 ====================
@@ -864,7 +967,7 @@ class MemoryEfficientAudioSystem:
         
         logger.info(f"MemoryEfficientAudioSystem initialized with {len(speaker_embeddings)} speakers")
     
-    async def generate_complete_audio(
+    def generate_complete_audio(
         self,
         dialogue_text: str,
         spacing_ms: float = 200.0,
@@ -889,7 +992,7 @@ class MemoryEfficientAudioSystem:
             if progress_callback:
                 progress_callback(0.1, "음성 생성 중...")
             
-            segment_files = await self.segment_generator.generate_segments_to_files(
+            segment_files = self.segment_generator.generate_segments_to_files(
                 segments, 
                 lambda p, msg: progress_callback(0.1 + p * 0.5, msg) if progress_callback else None
             )

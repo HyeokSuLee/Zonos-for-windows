@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "mcp__sequential-thinking__sequentialthinking",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find:*)",
+      "Read(//proc/**)",
+      "Bash(lscpu:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(dmesg:*)",
+      "Bash(journalctl:*)",
+      "Bash(sensors:*)",
+      "Bash(cat:*)",
+      "WebSearch",
+      "WebFetch(domain:pypi.org)"
     ],
     "deny": [],
     "ask": []

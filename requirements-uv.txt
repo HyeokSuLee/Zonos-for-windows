@@ -160,6 +160,8 @@ packaging==25.0
     #   lazy-loader
     #   pooch
     #   transformers
+psutil==7.0.0
+    # via zonos memory monitoring (memory_efficient_audio.py)
 pandas==2.3.2
     # via gradio
 phonemizer==3.3.0

@@ -39,15 +39,15 @@ def generate_multi_speaker_audio(
     try:
         # 기본 입력 검증
         if not dialogue_text.strip():
-            return (None, None), seed, "대화 텍스트를 입력해주세요."
+            return None, seed, "대화 텍스트를 입력해주세요."
 
         if not SPEAKER_EMBEDDINGS:
-            return (None, None), seed, "적어도 하나의 화자를 추가해주세요."
+            return None, seed, "적어도 하나의 화자를 추가해주세요."
 
         # 모델 로드 확인
         selected_model = load_model_if_needed(model_choice)
         if selected_model is None:
-            return (None, None), seed, "모델을 로드할 수 없습니다."
+            return None, seed, "모델을 로드할 수 없습니다."
 
         # UI 설정값 업데이트
         DEFAULT_SETTINGS.update(
@@ -85,12 +85,12 @@ def generate_multi_speaker_audio(
                 
             try:
                 # 메모리 효율적 시스템으로 오디오 생성
-                result = asyncio.run(MEMORY_EFFICIENT_SYSTEM.generate_complete_audio(
+                result = MEMORY_EFFICIENT_SYSTEM.generate_complete_audio(
                     dialogue_text=dialogue_text,
                     spacing_ms=200.0,  # 기본 간격
                     target_lufs=-23.0,  # 기본 정규화 목표
                     progress_callback=progress_callback
-                ))
+                )
                 
                 # 최종 오디오 로드
                 sample_rate, final_audio = MEMORY_EFFICIENT_SYSTEM.load_final_audio_for_ui(result)
@@ -115,7 +115,7 @@ def generate_multi_speaker_audio(
                 print(f"메모리 효율적 시스템 오류: {e}")
                 # 임시파일 정리
                 MEMORY_EFFICIENT_SYSTEM.cleanup()
-                return (None, None), seed, f"메모리 효율적 생성 실패: {str(e)}"
+                return None, seed, f"메모리 효율적 생성 실패: {str(e)}"
         
         else:
             print("⚠️ 레거시 시스템으로 fallback - 메모리 사용량이 높을 수 있습니다")
@@ -124,7 +124,7 @@ def generate_multi_speaker_audio(
             dialogue_parts = parse_dialogue(dialogue_text)
 
             if not dialogue_parts:
-                return (None, None), seed, "유효한 대화를 찾을 수 없습니다."
+                return None, seed, "유효한 대화를 찾을 수 없습니다."
 
             # 화자 검증
             unknown_speakers = []
@@ -134,7 +134,7 @@ def generate_multi_speaker_audio(
 
             if unknown_speakers:
                 return (
-                    (None, None),
+                    None,
                     seed,
                     f"다음 화자를 찾을 수 없습니다: {', '.join(unknown_speakers)}"
                 )
@@ -226,9 +226,9 @@ def generate_multi_speaker_audio(
                     )
                     
                 except Exception as e:
-                    return (None, None), seed, f"오디오 합성 실패: {str(e)}"
+                    return None, seed, f"오디오 합성 실패: {str(e)}"
             else:
-                return (None, None), seed, "생성된 오디오가 없습니다."
+                return None, seed, "생성된 오디오가 없습니다."
 
     except Exception as e:
         print(f"음성 생성 중 오류 발생: {str(e)}")
@@ -242,4 +242,4 @@ def generate_multi_speaker_audio(
             except:
                 pass
                 
-        return (None, None), seed, f"음성 생성 중 오류 발생: {str(e)}"
+        return None, seed, f"음성 생성 중 오류 발생: {str(e)}"
